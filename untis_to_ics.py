@@ -96,33 +96,84 @@ def fold(line):
     return "\r\n ".join(p.decode() for p in parts)
 
 
+MERGE_GAP_MIN = 10  # gleiche Stunden mit höchstens so viel Pause werden zusammengefasst
+
+
+def minutes(t):
+    return (t // 100) * 60 + t % 100
+
+
+def simplify(lesson):
+    """Rohdaten aus WebUntis auf das Nötige reduzieren."""
+    notes = []
+    for key in ("substText", "lstext", "info"):
+        if lesson.get(key):
+            notes.append(lesson[key])
+    return {
+        "id": lesson["id"],
+        "date": lesson["date"],
+        "start": lesson["startTime"],
+        "end": lesson["endTime"],
+        "subject": short_of(lesson.get("su")) or "Unterricht",
+        "room": short_of(lesson.get("ro")),
+        "teacher": name_of(lesson.get("te")),
+        "code": lesson.get("code"),
+        "notes": notes,
+    }
+
+
+def overlaps(a, b):
+    return a["date"] == b["date"] and a["start"] < b["end"] and b["start"] < a["end"]
+
+
+def prepare(raw_lessons):
+    items = sorted((simplify(l) for l in raw_lessons), key=lambda l: (l["date"], l["start"]))
+
+    # Entfällt eine Stunde und gibt es zur selben Zeit Ersatz, nur den Ersatz zeigen.
+    items = [
+        l for l in items
+        if not (l["code"] == "cancelled"
+                and any(o is not l and o["code"] != "cancelled" and overlaps(l, o) for o in items))
+    ]
+
+    # Doppelstunden zu einem Termin zusammenfassen.
+    merged = []
+    for l in items:
+        prev = merged[-1] if merged else None
+        if (prev and prev["date"] == l["date"]
+                and prev["subject"] == l["subject"] and prev["room"] == l["room"]
+                and prev["code"] == l["code"] and prev["teacher"] == l["teacher"]
+                and 0 <= minutes(l["start"]) - minutes(prev["end"]) <= MERGE_GAP_MIN):
+            prev["end"] = l["end"]
+            prev["notes"] = prev["notes"] + [n for n in l["notes"] if n not in prev["notes"]]
+        else:
+            merged.append(dict(l))
+    return merged
+
+
 def build_event(lesson, now):
-    subject = name_of(lesson.get("su")) or "Unterricht"
-    room = short_of(lesson.get("ro"))
-    teacher = name_of(lesson.get("te"))
-    code = lesson.get("code")
+    subject, room, code = lesson["subject"], lesson["room"], lesson["code"]
 
     if code == "cancelled":
-        title = f"❌ Entfall: {subject}"
+        title = f"❌ {subject}"
     elif code == "irregular":
-        title = f"🔄 Geändert: {subject}"
+        title = f"🔄 {subject} · {room}" if room else f"🔄 {subject}"
     else:
-        title = subject
+        title = f"{subject} · {room}" if room else subject
 
+    # Zusatzinfos nur bei Änderungen
     notes = []
     if code == "cancelled":
-        notes.append("Diese Stunde entfällt.")
+        notes.append("Entfällt")
     elif code == "irregular":
-        notes.append("Diese Stunde wurde geändert (Vertretung/Raum/Lehrkraft).")
-    if teacher:
-        notes.append(f"Lehrkraft: {teacher}")
-    for key, label in (("substText", "Vertretungstext"), ("lstext", "Info"), ("info", "Hinweis")):
-        if lesson.get(key):
-            notes.append(f"{label}: {lesson[key]}")
+        if lesson["teacher"]:
+            notes.append(f"Lehrkraft: {lesson['teacher']}")
+    if code in ("cancelled", "irregular"):
+        notes.extend(lesson["notes"])
 
-    start = to_dt(lesson["date"], lesson["startTime"])
-    end = to_dt(lesson["date"], lesson["endTime"])
-    uid = f"{lesson['id']}-{lesson['date']}-{lesson['startTime']}@untis-ical"
+    start = to_dt(lesson["date"], lesson["start"])
+    end = to_dt(lesson["date"], lesson["end"])
+    uid = f"{lesson['id']}-{lesson['date']}-{lesson['start']}@untis-ical"
 
     lines = [
         "BEGIN:VEVENT",
@@ -132,8 +183,6 @@ def build_event(lesson, now):
         f"DTEND:{utc(end)}",
         f"SUMMARY:{esc(title)}",
     ]
-    if room:
-        lines.append(f"LOCATION:{esc(room)}")
     if notes:
         lines.append(f"DESCRIPTION:{esc(chr(10).join(notes))}")
     lines.append("END:VEVENT")
@@ -185,8 +234,8 @@ def main():
         pass  # Abmelden ist nicht kritisch
 
     now = dt.datetime.now(dt.timezone.utc)
-    lessons.sort(key=lambda l: (l["date"], l["startTime"]))
-    events = [build_event(l, now) for l in lessons]
+    prepared = prepare(lessons)
+    events = [build_event(l, now) for l in prepared]
 
     calendar = "\r\n".join(
         [
@@ -208,9 +257,9 @@ def main():
     with open(out_file, "w", encoding="utf-8", newline="") as fh:
         fh.write(calendar)
 
-    cancelled = sum(1 for l in lessons if l.get("code") == "cancelled")
-    changed = sum(1 for l in lessons if l.get("code") == "irregular")
-    print(f"{len(lessons)} Stunden gespeichert ({cancelled} Entfall, {changed} geändert) -> {out_file}")
+    cancelled = sum(1 for l in prepared if l["code"] == "cancelled")
+    changed = sum(1 for l in prepared if l["code"] == "irregular")
+    print(f"{len(prepared)} Termine gespeichert ({cancelled} Entfall, {changed} geändert) -> {out_file}")
 
 
 if __name__ == "__main__":

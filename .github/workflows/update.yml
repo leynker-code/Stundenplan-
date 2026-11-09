@@ -1,0 +1,46 @@
+name: Stundenplan aktualisieren
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # alle 30 Minuten (GitHub kann das um einige Minuten verzögern)
+  workflow_dispatch:          # zum manuellen Starten
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Stundenplan von WebUntis holen
+        env:
+          UNTIS_SERVER: humboldt-schule.webuntis.com
+          UNTIS_SCHOOL: ${{ secrets.UNTIS_SCHOOL }}
+          UNTIS_USER: ${{ secrets.UNTIS_USER }}
+          UNTIS_PASSWORD: ${{ secrets.UNTIS_PASSWORD }}
+          OUTPUT_FILE: _site/${{ secrets.CAL_TOKEN }}.ics
+        run: python untis_to_ics.py
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - id: deployment
+        uses: actions/deploy-pages@v4

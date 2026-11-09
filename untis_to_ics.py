@@ -13,6 +13,7 @@ Nur Python-Standardbibliothek, keine Installation noetig.
 import datetime as dt
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -103,6 +104,38 @@ def minutes(t):
     return (t // 100) * 60 + t % 100
 
 
+# Anzeigenamen der Fächer. Links: Kürzel aus WebUntis OHNE Zusätze (M-L, KU2 -> M, KU).
+# Unbekannte Kürzel erscheinen so, wie sie sind; hier einfach ergänzen.
+SUBJECT_NAMES = {
+    "M": "Mathematik",
+    "E": "Englisch",
+    "D": "Deutsch",
+    "CH": "Chemie",
+    "PW": "Politik und Wirtschaft",
+    "INFO": "Informatik",
+    "WIWI": "Wirtschaft",
+    "KU": "Kunst",
+    "SPO": "Sport",
+}
+
+
+def subject_name(raw):
+    """'M-L' -> 'Mathematik', 'KU2' -> 'Kunst' (Leistungskurs, Nummern usw. entfallen)."""
+    first = raw.split(",")[0].strip()
+    base = re.split(r"[-_/\s\d]", first)[0] or first
+    return SUBJECT_NAMES.get(base.upper(), base)
+
+
+def clean_room(text):
+    """'C07 - Chemie' -> 'C07' (bei mehreren Räumen jeweils der Teil vor ' - ')."""
+    return ", ".join(part.split(" - ")[0].strip() for part in text.split(", ") if part)
+
+
+def local(d):
+    """Lokale Zeit ohne Zeitzonenangabe, damit iOS keine 'GMT'-Zeile zeigt."""
+    return d.strftime("%Y%m%dT%H%M%S")
+
+
 def simplify(lesson):
     """Rohdaten aus WebUntis auf das Nötige reduzieren."""
     notes = []
@@ -114,8 +147,8 @@ def simplify(lesson):
         "date": lesson["date"],
         "start": lesson["startTime"],
         "end": lesson["endTime"],
-        "subject": short_of(lesson.get("su")) or "Unterricht",
-        "room": short_of(lesson.get("ro")),
+        "subject": subject_name(short_of(lesson.get("su"))) if lesson.get("su") else "Unterricht",
+        "room": clean_room(short_of(lesson.get("ro"))),
         "teacher": name_of(lesson.get("te")),
         "code": lesson.get("code"),
         "notes": notes,
@@ -141,8 +174,7 @@ def prepare(raw_lessons):
     for l in items:
         prev = merged[-1] if merged else None
         if (prev and prev["date"] == l["date"]
-                and prev["subject"] == l["subject"] and prev["room"] == l["room"]
-                and prev["code"] == l["code"] and prev["teacher"] == l["teacher"]
+                and prev["subject"] == l["subject"] and prev["code"] == l["code"]
                 and 0 <= minutes(l["start"]) - minutes(prev["end"]) <= MERGE_GAP_MIN):
             prev["end"] = l["end"]
             prev["notes"] = prev["notes"] + [n for n in l["notes"] if n not in prev["notes"]]
@@ -154,33 +186,36 @@ def prepare(raw_lessons):
 def build_event(lesson, now):
     subject, room, code = lesson["subject"], lesson["room"], lesson["code"]
 
+    # Im Titel steht nur das Fach; Raum/Lehrkraft nur bei Änderungen in der Beschreibung
     if code == "cancelled":
         title = f"❌ {subject}"
     elif code == "irregular":
-        title = f"🔄 {subject} · {room}" if room else f"🔄 {subject}"
+        title = f"🔄 {subject}"
     else:
-        title = f"{subject} · {room}" if room else subject
+        title = subject
 
-    # Zusatzinfos nur bei Änderungen
     notes = []
     if code == "cancelled":
         notes.append("Entfällt")
     elif code == "irregular":
+        if room:
+            notes.append(f"Raum: {room}")
         if lesson["teacher"]:
             notes.append(f"Lehrkraft: {lesson['teacher']}")
     if code in ("cancelled", "irregular"):
         notes.extend(lesson["notes"])
 
-    start = to_dt(lesson["date"], lesson["start"])
-    end = to_dt(lesson["date"], lesson["end"])
+    start = to_dt(lesson["date"], lesson["start"]).replace(tzinfo=None)
+    # 1 Minute früher enden, damit iOS aufeinanderfolgende Stunden nicht versetzt anzeigt
+    end = to_dt(lesson["date"], lesson["end"]).replace(tzinfo=None) - dt.timedelta(minutes=1)
     uid = f"{lesson['id']}-{lesson['date']}-{lesson['start']}@untis-ical"
 
     lines = [
         "BEGIN:VEVENT",
         f"UID:{uid}",
         f"DTSTAMP:{utc(now)}",
-        f"DTSTART:{utc(start)}",
-        f"DTEND:{utc(end)}",
+        f"DTSTART:{local(start)}",
+        f"DTEND:{local(end)}",
         f"SUMMARY:{esc(title)}",
     ]
     if notes:
